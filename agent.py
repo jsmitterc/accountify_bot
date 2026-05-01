@@ -5,16 +5,13 @@ import json
 from datetime import date as _date
 from typing import Any
 
-from claude_agent_sdk import (
-    ClaudeAgentOptions,
-    ResultMessage,
-    create_sdk_mcp_server,
-    query,
-    tool,
-)
+import anthropic
 
 from accountify_client import AccountifyClient, to_amount
 
+
+MODEL = "claude-opus-4-7"
+MAX_TURNS = 4
 
 SYSTEM_PROMPT = """You are an accounting assistant for Accountify, a double-entry bookkeeping app.
 
@@ -50,69 +47,66 @@ RULES
 - Keep the final reply to one sentence. No markdown, no headings.
 """
 
-
-def build_tools(client: AccountifyClient, entity_id: str):
-    """Build the in-process MCP server with the create_transaction tool."""
-
-    @tool(
-        "create_transaction",
-        "Create a balanced double-entry transaction. The expense account is debited and the asset/liability account is credited by the same amount.",
-        {
-            "date": str,
-            "description": str,
-            "currency": str,
-            "amount": str,
-            "debit_account_id": str,
-            "credit_account_id": str,
+TOOLS: list[dict[str, Any]] = [
+    {
+        "name": "create_transaction",
+        "description": (
+            "Create a balanced double-entry transaction. The expense account is debited "
+            "and the asset/liability account is credited by the same amount."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date": {"type": "string", "description": "ISO date YYYY-MM-DD"},
+                "description": {"type": "string", "description": "Short human-readable label"},
+                "currency": {"type": "string", "description": "ISO 4217 code, e.g. AUD"},
+                "amount": {"type": "string", "description": "Decimal amount as a string, e.g. 50.18"},
+                "debit_account_id": {"type": "string", "description": "Expense account id"},
+                "credit_account_id": {"type": "string", "description": "Asset or liability account id"},
+            },
+            "required": [
+                "date",
+                "description",
+                "currency",
+                "amount",
+                "debit_account_id",
+                "credit_account_id",
+            ],
         },
-    )
-    async def create_transaction_tool(args: dict) -> dict:
-        try:
-            amount = to_amount(args["amount"])
-            entries = [
-                {
-                    "account": args["debit_account_id"],
-                    "debit_amount": amount,
-                    "credit_amount": "0.00",
-                    "currency": args["currency"],
-                },
-                {
-                    "account": args["credit_account_id"],
-                    "debit_amount": "0.00",
-                    "credit_amount": amount,
-                    "currency": args["currency"],
-                },
-            ]
-            result = await client.create_transaction(
-                entity_id=entity_id,
-                date=args["date"],
-                description=args["description"],
-                entries=entries,
-            )
-            return {
-                "content": [
-                    {
-                        "type": "text",
-                        "text": json.dumps(
-                            {
-                                "id": result.get("id"),
-                                "is_balanced": result.get("is_balanced"),
-                                "total_amount": result.get("total_amount"),
-                            }
-                        ),
-                    }
-                ]
-            }
-        except Exception as exc:
-            return {
-                "content": [{"type": "text", "text": f"ERROR: {type(exc).__name__}: {exc}"}],
-                "is_error": True,
-            }
+    }
+]
 
-    return create_sdk_mcp_server(
-        name="accountify",
-        version="0.1.0",
-        tools=[create_transaction_tool],
+
+async def _execute_create_transaction(
+    args: dict[str, Any], client: AccountifyClient, entity_id: str
+) -> str:
+    amount = to_amount(args["amount"])
+    entries = [
+        {
+            "account": args["debit_account_id"],
+            "debit_amount": amount,
+            "credit_amount": "0.00",
+            "currency": args["currency"],
+        },
+        {
+            "account": args["credit_account_id"],
+            "debit_amount": "0.00",
+            "credit_amount": amount,
+            "currency": args["currency"],
+        },
+    ]
+    result = await client.create_transaction(
+        entity_id=entity_id,
+        date=args["date"],
+        description=args["description"],
+        entries=entries,
+    )
+    return json.dumps(
+        {
+            "id": result.get("id"),
+            "is_balanced": result.get("is_balanced"),
+            "total_amount": result.get("total_amount"),
+        }
     )
 
 
@@ -131,25 +125,78 @@ async def run_agent(utterance: str, client: AccountifyClient, entity_id: str) ->
         if a.get("is_active", True)
     ]
 
-    server = build_tools(client, entity_id)
     today = _date.today().isoformat()
+    anthropic_client = anthropic.AsyncAnthropic()
 
-    user_prompt = (
-        f"Today: {today}\n"
-        f"Utterance: {utterance.strip()}\n"
-        f"Available accounts (JSON):\n{json.dumps(slim_accounts, indent=2)}"
-    )
+    # Stable prefix (accounts list) is cached; volatile suffix (date + utterance) is not.
+    messages: list[dict[str, Any]] = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": f"Available accounts (JSON):\n{json.dumps(slim_accounts, indent=2)}",
+                    "cache_control": {"type": "ephemeral"},
+                },
+                {
+                    "type": "text",
+                    "text": (
+                        f"Today: {today}\n"
+                        f"Utterance: {utterance.strip()}\n\n"
+                        "Identify the two accounts and call create_transaction once."
+                    ),
+                },
+            ],
+        }
+    ]
 
-    options = ClaudeAgentOptions(
-        system_prompt=SYSTEM_PROMPT,
-        mcp_servers={"accountify": server},
-        allowed_tools=["mcp__accountify__create_transaction"],
-        max_turns=4,
-    )
+    for _ in range(MAX_TURNS):
+        response = await anthropic_client.messages.create(
+            model=MODEL,
+            max_tokens=1024,
+            system=[
+                {
+                    "type": "text",
+                    "text": SYSTEM_PROMPT,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+            tools=TOOLS,
+            messages=messages,
+        )
 
-    final_text = ""
-    async for message in query(prompt=user_prompt, options=options):
-        if isinstance(message, ResultMessage):
-            final_text = (message.result or "").strip()
+        if response.stop_reason == "end_turn":
+            text = next((b.text for b in response.content if b.type == "text"), "")
+            return text.strip() or "Sorry, I couldn't process that."
 
-    return final_text or "Sorry, I couldn't process that."
+        if response.stop_reason != "tool_use":
+            break
+
+        messages.append({"role": "assistant", "content": response.content})
+
+        tool_results: list[dict[str, Any]] = []
+        for block in response.content:
+            if block.type != "tool_use":
+                continue
+            try:
+                result_text = await _execute_create_transaction(block.input, client, entity_id)
+                tool_results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": result_text,
+                    }
+                )
+            except Exception as exc:
+                tool_results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": f"ERROR: {type(exc).__name__}: {exc}",
+                        "is_error": True,
+                    }
+                )
+
+        messages.append({"role": "user", "content": tool_results})
+
+    return "Sorry, I couldn't process that."
